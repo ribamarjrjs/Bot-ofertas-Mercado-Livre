@@ -1,6 +1,7 @@
 const puppeteer = require("puppeteer");
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
+const cron = require("node-cron");
 
 console.log("🚀 INICIANDO BOT DE OFERTAS COM MERCADO LIVRE...");
 
@@ -13,7 +14,7 @@ const client = new Client({
 });
 
 const GROUP_NAME = "";
-const GROUP_ID = process.env.WHATSAPP_GROUP_ID || "120363405725784343@g.us,120363405868385127@g.us"; // compat: único
+const GROUP_ID = process.env.WHATSAPP_GROUP_ID || "120363405725784343@g.us,120363405868385127@g.us,120363025479141515@g.us,557187740544-1483027967@g.us,120363257449255532@g.us,559991352257-1438645928@g.us,120363023808026901@g.us,120363421445687015@g.us,120363147082562504@g.us"; // compat: único
 // Suporte a múltiplos grupos via variáveis separadas por vírgula
 const GROUP_IDS = (process.env.WHATSAPP_GROUP_IDS || GROUP_ID)
     .split(',')
@@ -26,9 +27,23 @@ const GROUP_NAMES = (process.env.WHATSAPP_GROUP_NAMES || GROUP_NAME)
 
 // ==========================================================
 // AQUI: Altere este número para a quantidade de ofertas que você deseja
-const NUMERO_DE_OFERTAS = 5; 
+const NUMERO_DE_OFERTAS = 10; 
 // ==========================================================
 
+// ==========================================================
+// URL da página de ofertas do Mercado Livre
+// Altere aqui para buscar ofertas de outra página!
+const URL_PAGINA_OFERTAS = 'https://www.mercadolivre.com.br/ofertas#nav-header';
+// ==========================================================
+
+function limparLink(url) {
+    if (!url) return '';
+    const match = url.match(/(https?:\/\/(www\.)?mercadolivre\.com\.br\/((p|produto)\/)?(MLB|MCO|MLM|MLC|MPE|MLU|MLV|MEC)-?[^?#]+)/i);
+    if (match && match[1]) {
+        return match[1];
+    }
+    return url.split('?')[0].split('#')[0];
+}
 
 // Funções da Etapa 1
 async function buscarOfertasReais() {
@@ -39,11 +54,10 @@ async function buscarOfertasReais() {
         const page = await browser.newPage();
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         await page.setViewport({ width: 1366, height: 768 });
-        await page.goto('https://www.mercadolivre.com.br/ofertas?container_id=MLB779535-1&domain_id=MLB-CELLPHONES#filter_applied=domain_id&filter_position=6&is_recommended_domain=false&origin=scut', { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(URL_PAGINA_OFERTAS, { waitUntil: 'networkidle2', timeout: 30000 });
         await new Promise(resolve => setTimeout(resolve, 5000));
         
-        // A variável NUMERO_DE_OFERTAS é passada para a função do navegador
-        const ofertas = await page.evaluate((limite) => {
+        const ofertasBrutas = await page.evaluate(() => {
             const items = [];
             const titulosVistos = new Set();
             const elementos = document.querySelectorAll('[class*="card"], [class*="item"], [class*="product"]');
@@ -57,7 +71,6 @@ async function buscarOfertasReais() {
                             break;
                         }
                     }
-                    // precoPor (atual) e precoDe (riscado)
                     let precoPor = '';
                     let precoDe = '';
                     const priceContainerPor = elemento.querySelector('.andes-money-amount:not(s .andes-money-amount)');
@@ -88,19 +101,63 @@ async function buscarOfertasReais() {
                     if (imgEl) {
                         imagem = imgEl.dataset.src || imgEl.src;
                     }
+                    // CAPTURA O DESCONTO VISUAL (ex: "51% OFF")
+                    let descontoVisual = '';
+                    let descontoPercentual = 0;
+                    // Tenta encontrar o texto de desconto visual
+                    const descontoEl = elemento.querySelector('[class*="discount"], [class*="off"], [class*="percent"], .andes-money-amount__discount, .ui-search-price__discount, .ui-search-item__discount-label');
+                    if (descontoEl && descontoEl.textContent) {
+                        descontoVisual = descontoEl.textContent.trim();
+                        const match = descontoVisual.match(/(\d{1,3})%\s*OFF/i);
+                        if (match) {
+                            descontoPercentual = parseInt(match[1], 10);
+                        }
+                    } else {
+                        // Busca por qualquer texto tipo "51% OFF" no elemento
+                        const texto = elemento.textContent;
+                        const match = texto.match(/(\d{1,3})%\s*OFF/i);
+                        if (match) {
+                            descontoVisual = match[0];
+                            descontoPercentual = parseInt(match[1], 10);
+                        }
+                    }
                     if (titulo && precoPor && link && !titulosVistos.has(titulo)) {
                         if (!titulo.toLowerCase().includes('frete') && titulo.length > 15) {
                             titulosVistos.add(titulo);
-                            items.push({ titulo: titulo.substring(0, 100), precoPor: precoPor, precoDe: precoDe, link: link, imagem: imagem });
-                            // AQUI: o limite da busca agora usa a variável
-                            if (items.length >= limite) break;
+                            items.push({ titulo: titulo.substring(0, 100), precoPor, precoDe, link, imagem, descontoVisual, descontoPercentual });
                         }
                     }
                 } catch (error) {}
             }
             return items;
-        }, NUMERO_DE_OFERTAS); // Passando a variável para a função
-
+        });
+        // Ordena por maior desconto visual (percentual)
+        let ofertasOrdenadas = ofertasBrutas.filter(o => o.descontoPercentual > 0)
+            .sort((a, b) => b.descontoPercentual - a.descontoPercentual);
+        // Fallback: se não houver desconto visual, calcula pelo preço
+        if (ofertasOrdenadas.length === 0) {
+            const normalizar = v => parseFloat((v||'').replace(/[^0-9,]/g, '').replace(/\./g, '').replace(',', '.'));
+            ofertasOrdenadas = ofertasBrutas.map(oferta => {
+                let desconto = 0;
+                if (oferta.precoDe && oferta.precoPor) {
+                    const deNum = normalizar(oferta.precoDe);
+                    const porNum = normalizar(oferta.precoPor);
+                    if (deNum && porNum && deNum > porNum) {
+                        desconto = Math.round((1 - (porNum / deNum)) * 100);
+                    }
+                }
+                return { ...oferta, descontoPercentual: desconto };
+            }).filter(o => o.descontoPercentual > 0)
+            .sort((a, b) => b.descontoPercentual - a.descontoPercentual);
+        }
+        // Se ainda não houver, pega as de menor preço
+        let ofertas;
+        if (ofertasOrdenadas.length > 0) {
+            ofertas = ofertasOrdenadas.slice(0, NUMERO_DE_OFERTAS);
+        } else {
+            const normalizar = v => parseFloat((v||'').replace(/[^0-9,]/g, '').replace(/\./g, '').replace(',', '.'));
+            ofertas = ofertasBrutas.sort((a, b) => normalizar(a.precoPor) - normalizar(b.precoPor)).slice(0, NUMERO_DE_OFERTAS);
+        }
         await browser.close();
         console.log(`✅ Links encontrados: ${ofertas.length}`);
         return ofertas;
@@ -128,7 +185,6 @@ async function buscarMaisOfertas() {
                     const tituloEl = produto.querySelector('.ui-search-item__title');
                     const linkEl = produto.querySelector('a.ui-search-link');
                     const imgEl = produto.querySelector('img.ui-search-result-image__element');
-                    // precoPor e precoDe
                     let precoPor = '';
                     let precoDe = '';
                     const priceContainerPor = produto.querySelector('.andes-money-amount:not(s .andes-money-amount)');
@@ -156,7 +212,6 @@ async function buscarMaisOfertas() {
                         if (!titulo.toLowerCase().includes('frete') && titulo.length > 15) {
                             titulosVistos.add(titulo);
                             items.push({ titulo: titulo.substring(0, 100), precoPor: precoPor, precoDe: precoDe, link: link, imagem: imagem || '' });
-                            // Pode ajustar este limite se quiser, ele é só um fallback
                             if (items.length >= 5) break; 
                         }
                     }
@@ -180,7 +235,6 @@ async function verificarPrecoRealNaPagina(url, browser) {
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         await page.goto(url, { waitUntil: 'networkidle2', timeout: 25000 });
         const precoReal = await page.evaluate(() => {
-            // precoPor: preço atual (não riscado)
             let containerPor = document.querySelector('.ui-pdp-price__first-line .andes-money-amount');
             if (!containerPor) {
                 const todos = Array.from(document.querySelectorAll('.andes-money-amount'));
@@ -194,7 +248,6 @@ async function verificarPrecoRealNaPagina(url, browser) {
                 const centavos = centavosEl ? centavosEl.innerText.trim() : '00';
                 precoPor = `R$ ${fracao},${centavos}`;
             }
-            // precoDe: preço anterior, riscado
             let precoDe = null;
             const candidatoDe = document.querySelector('s .andes-money-amount')
                 || document.querySelector('.andes-money-amount--previous')
@@ -301,24 +354,42 @@ async function gerarLinkAfiliado(urlProduto) {
             await page.keyboard.press('Enter').catch(() => {});
         }
 
-        const linkCurto = await page.waitForFunction(() => {
-            const regex = /(https?:\/\/\S*(meli\.link|mercadolivre\.com\/sec\/)[^\s]*)/i;
+        const linkCurtoHandle = await page.waitForFunction(() => {
+            const regex = /(https?:\/\/(?:meli\.link|mercadolivre\.com\/sec)\/[a-zA-Z0-9]+)(?:\s*Link)?/i;
             const candidatos = Array.from(document.querySelectorAll('input, textarea, a, div, span'));
             for (const el of candidatos) {
                 const val = (el.value || el.href || el.textContent || '').trim();
                 if (regex.test(val)) {
                     const m = val.match(regex);
-                    return m ? m[1] : null;
+                    // Retorna um objeto de depuração para análise
+                    return JSON.stringify({
+                        val: val,
+                        m0: m[0],
+                        m1: m[1]
+                    });
                 }
             }
             return null;
         }, { timeout: 30000 });
 
-        const urlCurta = await linkCurto.jsonValue();
+        const debugInfoStr = await linkCurtoHandle.jsonValue();
+        const debugInfo = JSON.parse(debugInfoStr);
+        let urlCurta = debugInfo.m1; // O link correto está em m1
+        // Remove qualquer "Link" ou espaços ao final do link
+        if (urlCurta) {
+            urlCurta = urlCurta.replace(/Link$/i, '').trim();
+        }
+
         await page.bringToFront();
         return urlCurta || urlProduto;
     } catch (e) {
         console.log('⚠️ Falha ao gerar link de afiliado, usando URL original. Motivo:', e.message);
+        if (linkBuilderPage) {
+            const timestamp = Date.now();
+            const screenshotPath = `debug-afiliado-${timestamp}.png`;
+            await linkBuilderPage.screenshot({ path: screenshotPath });
+            console.log(`   📸 Screenshot de depuração salvo em: ${screenshotPath}`);
+        }
         return urlProduto;
     }
 }
@@ -397,8 +468,12 @@ client.on("ready", async () => {
                         }
                     }
                     const linhaPreco = oferta.precoDe ? `💸 ~De: ${oferta.precoDe}~\n💰 Por: *${oferta.precoPor}*${descontoLinha}` : `💰 Preço: *${oferta.precoPor}*`;
-                    const linkAfiliado = await gerarLinkAfiliado(oferta.link);
-                    const mensagem = `🔥 *${oferta.titulo}*\n${linhaPreco}\n🔗 ${linkAfiliado}`;
+                    
+                    const linkAfiliado = await gerarLinkAfiliado(limparLink(oferta.link));
+
+                    const mensagem = `🔥 *${oferta.titulo}*
+${linhaPreco}
+🔗 ${linkAfiliado}`;
                     console.log(`   ⏳ Enviando: ${oferta.titulo} - ${oferta.precoPor}${oferta.precoDe ? ` (De ${oferta.precoDe})` : ''}`);
                     for (const grupo of grupos) {
                         if (oferta.imagem && oferta.imagem.startsWith('http')) {
@@ -417,6 +492,15 @@ client.on("ready", async () => {
             }
             console.log("🎉 PROCESSO CONCLUÍDO!");
 
+            // Fecha o navegador de afiliados, se estiver aberto
+            if (browserAfiliadosCompartilhado) {
+                try {
+                    await browserAfiliadosCompartilhado.close();
+                } catch (e) {}
+                browserAfiliadosCompartilhado = null;
+                linkBuilderPage = null;
+            }
+
         } catch (error) {
             console.log("❌ ERRO CRÍTICO:", error.message);
             if (browserParaVerificacao) await browserParaVerificacao.close();
@@ -425,12 +509,9 @@ client.on("ready", async () => {
 
     // Executa imediatamente e agenda para todo dia às 09:00
     await rodar();
-    scheduleDailyAt('', rodar);
+    // O agendamento diário pode ser feito com node-cron, por exemplo:
+    // cron.schedule('0 9 * * *', rodar);
 });
 
 console.log("⏳ Inicializando WhatsApp Web...");
-client.initialize();
-
-console.log("⏳ Inicializando WhatsApp Web...");
-
 client.initialize();
